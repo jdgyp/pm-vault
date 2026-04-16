@@ -1,0 +1,407 @@
+name: PM Vault — Claude curator
+
+# Triggers on push to main, but ONLY when the Ideas Inbox changes.
+# This avoids running Claude on every commit (e.g. after Claude's own
+# updates get pushed back by obsidian-git).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "00-inbox/Ideas Inbox.md"
+
+# Prevent concurrent runs — if you push twice quickly, the second
+# run waits rather than racing with the first.
+concurrency:
+  group: claude-curator
+  cancel-in-progress: false
+
+jobs:
+  curate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # contents:write covers both pushing commits and creating releases/tags.
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Check out the full vault ───────────────────────────────────────
+      - name: Checkout vault
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history so git blame works if needed
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Check the inbox has actual content to process ──────────────────
+      - name: Check inbox has ideas
+        id: check-inbox
+        run: |
+          # Read everything between the <!-- IDEAS GO HERE --> marker and the end of file
+          # If there's nothing meaningful, skip the rest of the run.
+          INBOX_CONTENT=$(python3 - <<'PYEOF'
+          import re, sys
+          with open("00-inbox/Ideas Inbox.md", "r") as f:
+              content = f.read()
+          # Find content after the marker
+          marker = "<!-- IDEAS GO HERE -->"
+          idx = content.find(marker)
+          if idx == -1:
+              print("")
+          else:
+              after = content[idx + len(marker):].strip()
+              # Strip archived sections (lines starting with ## Archived)
+              after = re.split(r'^## Archived', after, flags=re.MULTILINE)[0].strip()
+              print(after)
+          PYEOF
+          )
+
+          if [ -z "$INBOX_CONTENT" ]; then
+            echo "has_ideas=false" >> $GITHUB_OUTPUT
+            echo "Inbox is empty — skipping run."
+          else
+            echo "has_ideas=true" >> $GITHUB_OUTPUT
+            echo "Inbox has content — proceeding."
+          fi
+
+      # ── 3. Build context: vault tree + key note contents ─────────────────
+      - name: Build vault context
+        id: build-context
+        if: steps.check-inbox.outputs.has_ideas == 'true'
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, re
+
+          vault_root = "."
+
+          # --- Inbox content (above the archive line) ---
+          with open("00-inbox/Ideas Inbox.md", "r") as f:
+              inbox_raw = f.read()
+          marker = "<!-- IDEAS GO HERE -->"
+          idx = inbox_raw.find(marker)
+          inbox_ideas = ""
+          if idx != -1:
+              after = inbox_raw[idx + len(marker):].strip()
+              inbox_ideas = re.split(r'^## Archived', after, flags=re.MULTILINE)[0].strip()
+
+          # --- Claude instructions ---
+          instructions = ""
+          instructions_path = "99-meta/CLAUDE-INSTRUCTIONS.md"
+          if os.path.exists(instructions_path):
+              with open(instructions_path, "r") as f:
+                  instructions = f.read()
+
+          # --- Vault file tree (exclude .git, .obsidian, attachments) ---
+          tree_lines = []
+          for root, dirs, files in os.walk("."):
+              # Skip hidden dirs and obsidian internals
+              dirs[:] = [d for d in sorted(dirs)
+                        if not d.startswith(".") and d not in ("node_modules",)]
+              level = root.replace(".", "").count(os.sep)
+              indent = "  " * level
+              folder = os.path.basename(root)
+              if folder != ".":
+                  tree_lines.append(f"{indent}{folder}/")
+              for file in sorted(files):
+                  if file.endswith(".md"):
+                      tree_lines.append(f"{indent}  {file}")
+          tree_str = "\n".join(tree_lines)
+
+          # --- Content of all _index.md (MoC) files ---
+          moc_contents = {}
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if not d.startswith(".")]
+              for file in files:
+                  if file == "_index.md":
+                      path = os.path.join(root, file).lstrip("./")
+                      with open(os.path.join(root, file), "r") as f:
+                          moc_contents[path] = f.read()
+
+          # --- Content of notes that might be related (simple keyword match) ---
+          # Find words from inbox (3+ chars, deduplicated)
+          words = set(re.findall(r'\b[a-zA-Z]{3,}\b', inbox_ideas.lower()))
+          stopwords = {"the","and","for","with","this","that","from","have",
+                       "will","been","more","into","they","what","when","then",
+                       "than","also","some","can","are","its","not","but","you"}
+          words -= stopwords
+
+          related_notes = {}
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if not d.startswith(".")]
+              for file in files:
+                  if not file.endswith(".md") or file == "Ideas Inbox.md":
+                      continue
+                  path = os.path.join(root, file).lstrip("./")
+                  with open(os.path.join(root, file), "r") as f:
+                      content = f.read()
+                  content_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', content.lower()))
+                  overlap = len(words & content_words)
+                  if overlap >= 3:
+                      related_notes[path] = content
+
+          # Cap at 10 most-overlapping related notes to keep context size sane
+          if len(related_notes) > 10:
+              scored = {p: len(words & set(re.findall(r'\b[a-zA-Z]{3,}\b', c.lower())))
+                        for p, c in related_notes.items()}
+              top_paths = sorted(scored, key=scored.get, reverse=True)[:10]
+              related_notes = {p: related_notes[p] for p in top_paths}
+
+          # --- Write context to a temp file for the next step ---
+          context = {
+              "instructions": instructions,
+              "inbox_ideas": inbox_ideas,
+              "vault_tree": tree_str,
+              "moc_contents": moc_contents,
+              "related_notes": related_notes,
+          }
+          with open("/tmp/vault_context.json", "w") as f:
+              json.dump(context, f, ensure_ascii=False, indent=2)
+
+          print(f"Context built: {len(inbox_ideas)} chars in inbox, "
+                f"{len(moc_contents)} MoCs, {len(related_notes)} related notes.")
+          PYEOF
+
+      # ── 4. Call Gemini API ────────────────────────────────────────────────
+      - name: Call Gemini
+        id: call-claude
+        if: steps.check-inbox.outputs.has_ideas == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          with open("/tmp/vault_context.json", "r") as f:
+              ctx = json.load(f)
+
+          # Build the prompt — Gemini uses a single contents array,
+          # so we combine system instructions + user message into one turn.
+          moc_section = "\n\n".join(
+              f"### {path}\n{content}"
+              for path, content in ctx["moc_contents"].items()
+          ) or "(no MoC files yet)"
+
+          related_section = "\n\n".join(
+              f"### {path}\n{content}"
+              for path, content in ctx["related_notes"].items()
+          ) or "(no related notes found)"
+
+          full_prompt = f"""{ctx['instructions']}
+
+          ---
+
+          ## Vault file tree
+
+          {ctx['vault_tree']}
+
+          ## Current MoC (index) files
+
+          {moc_section}
+
+          ## Related notes (keyword-matched to inbox)
+
+          {related_section}
+
+          ## Ideas Inbox — NEW CONTENT TO PROCESS
+
+          {ctx['inbox_ideas']}
+
+          ---
+
+          Process the inbox ideas above. Follow your instructions exactly.
+          Respond with valid JSON only — no markdown fences, no preamble.
+          """
+
+          payload = {
+              "contents": [
+                  {"role": "user", "parts": [{"text": full_prompt.strip()}]}
+              ],
+              "generationConfig": {
+                  "temperature": 0.2,
+                  "maxOutputTokens": 8192,
+              }
+          }
+
+          api_key = os.environ["GEMINI_API_KEY"]
+          model = "gemini-2.0-flash"
+          url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode(),
+              headers={"content-type": "application/json"},
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  result = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              body = e.read().decode()
+              print(f"Gemini API error {e.code}: {body}")
+              raise
+
+          gemini_text = result["candidates"][0]["content"]["parts"][0]["text"]
+
+          # Strip markdown fences if Gemini wrapped the JSON anyway
+          gemini_text = gemini_text.strip()
+          if gemini_text.startswith("```"):
+              gemini_text = gemini_text.split("\n", 1)[1]
+              gemini_text = gemini_text.rsplit("```", 1)[0].strip()
+
+          # Validate it's parseable JSON before saving
+          try:
+              parsed = json.loads(gemini_text)
+              with open("/tmp/claude_response.json", "w") as f:
+                  json.dump(parsed, f, ensure_ascii=False, indent=2)
+              print("Gemini responded with valid JSON.")
+              print(f"Operations: {len(parsed.get('file_operations', []))}")
+          except json.JSONDecodeError as e:
+              print(f"Gemini returned invalid JSON: {e}")
+              print("Raw response:")
+              print(gemini_text[:2000])
+              raise
+          PYEOF
+
+      # ── 5. Apply file operations ──────────────────────────────────────────
+      - name: Apply vault changes
+        if: steps.check-inbox.outputs.has_ideas == 'true'
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re
+          from datetime import date
+
+          with open("/tmp/claude_response.json", "r") as f:
+              resp = json.load(f)
+
+          ops = resp.get("file_operations", [])
+          changelog_entry = resp.get("changelog_entry", "")
+          archive_label = resp.get("inbox_archive_label", f"{date.today().isoformat()} batch")
+
+          # Apply file operations
+          for op in ops:
+              path = op["path"]
+              operation = op["operation"]
+
+              if operation == "create":
+                  os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+                  with open(path, "w") as f:
+                      f.write(op["content"])
+                  print(f"  Created: {path}")
+
+              elif operation == "update":
+                  os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+                  with open(path, "w") as f:
+                      f.write(op["content"])
+                  print(f"  Updated: {path}")
+
+              elif operation == "delete":
+                  if os.path.exists(path):
+                      os.remove(path)
+                      print(f"  Deleted: {path}")
+                  else:
+                      print(f"  Delete skipped (not found): {path}")
+
+          # Update changelog
+          changelog_path = "99-meta/CHANGELOG.md"
+          os.makedirs("99-meta", exist_ok=True)
+          today = date.today().isoformat()
+          new_entry = f"\n## {today}\n\n{changelog_entry}\n"
+
+          if os.path.exists(changelog_path):
+              with open(changelog_path, "r") as f:
+                  existing = f.read()
+              # Insert after the first heading line
+              if "# Changelog" in existing:
+                  updated = existing.replace("# Changelog\n", f"# Changelog\n{new_entry}", 1)
+              else:
+                  updated = f"# Changelog\n{new_entry}\n{existing}"
+          else:
+              updated = f"# Changelog\n{new_entry}"
+
+          with open(changelog_path, "w") as f:
+              f.write(updated)
+          print(f"  Updated changelog.")
+
+          # Archive processed ideas in the inbox
+          inbox_path = "00-inbox/Ideas Inbox.md"
+          with open(inbox_path, "r") as f:
+              inbox_content = f.read()
+
+          marker = "<!-- IDEAS GO HERE -->"
+          idx = inbox_content.find(marker)
+          if idx != -1:
+              after_marker = inbox_content[idx + len(marker):]
+              # Split off any existing archive section
+              parts = re.split(r'^(## Archived)', after_marker, flags=re.MULTILINE, maxsplit=1)
+              ideas_to_archive = parts[0].strip()
+              existing_archive = (parts[1] + parts[2]) if len(parts) > 1 else ""
+
+              # Rebuild: clear the live area, add archived section
+              new_content = (
+                  inbox_content[:idx + len(marker)] +
+                  "\n\n" +
+                  f"## Archived\n\n### {archive_label}\n\n{ideas_to_archive}\n\n" +
+                  existing_archive
+              )
+              with open(inbox_path, "w") as f:
+                  f.write(new_content)
+              print(f"  Archived inbox ideas under: {archive_label}")
+
+          # Save changelog entry + file list for the GitHub Release step
+          op_lines = []
+          for op in ops:
+              emoji = {"create": "✦", "update": "↻", "delete": "✕"}.get(op["operation"], "·")
+              op_lines.append(f"- {emoji} `{op['path']}`")
+
+          release_body = changelog_entry.strip()
+          if op_lines:
+              release_body += "\n\n**Files changed:**\n" + "\n".join(op_lines)
+
+          with open("/tmp/release_body.txt", "w") as f:
+              f.write(release_body)
+
+          print(f"\nDone. {len(ops)} file operations applied.")
+          PYEOF
+
+      # ── 6. Commit and push changes back ───────────────────────────────────
+      - name: Commit and push
+        id: commit
+        if: steps.check-inbox.outputs.has_ideas == 'true'
+        run: |
+          git config user.name  "Claude (PM Curator)"
+          git config user.email "claude-curator@users.noreply.github.com"
+
+          git add -A
+
+          # Only commit if there are actual changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            echo "committed=false" >> $GITHUB_OUTPUT
+          else
+            git commit -m "chore: Claude vault update -- $(date -u +%Y-%m-%d)"
+            git push
+            echo "committed=true" >> $GITHUB_OUTPUT
+            echo "Changes committed and pushed."
+          fi
+
+      # ── 7. Create GitHub Release with release notes ───────────────────────
+      - name: Create GitHub Release
+        if: >
+          steps.check-inbox.outputs.has_ideas == 'true' &&
+          steps.commit.outputs.committed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Tag format: vault-YYYY-MM-DD-HHMM
+          # Time component keeps same-day runs distinct.
+          TAG="vault-$(date -u +%Y-%m-%d-%H%M)"
+          TITLE="Vault update -- $(date -u '+%-d %B %Y')"
+
+          # Release body written by the apply step
+          BODY=$(cat /tmp/release_body.txt)
+
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes "$BODY" \
+            --latest
